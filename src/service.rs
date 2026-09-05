@@ -687,18 +687,18 @@ impl<R: CommandRunner> Remote<'_, R> {
     }
 
     fn install_file(&mut self, path: &Path, contents: Vec<u8>) -> Result<()> {
-        let mut args = vec![
-            OsString::from("-m"),
-            OsString::from("600"),
-            OsString::from("/dev/stdin"),
-            path.as_os_str().to_owned(),
-        ];
-        let mut ssh_args = vec![
+        // `cat`/`chmod` read their destination from an argument, not a `/dev/stdin`
+        // path, so this needs neither the `install` binary (undocumented as a NAS
+        // requirement) nor a `/dev/fd` mount, which some sandboxes don't provide.
+        let ssh_args = vec![
             OsString::from("--"),
             OsString::from(&self.target),
-            OsString::from("install"),
+            OsString::from("sh"),
+            OsString::from("-c"),
+            OsString::from("umask 077 && cat > \"$1\" && chmod 600 \"$1\""),
+            OsString::from("sh"),
+            path.as_os_str().to_owned(),
         ];
-        ssh_args.append(&mut args);
         let spec = CommandSpec {
             program: self.programs.ssh.clone(),
             args: ssh_args,
@@ -710,7 +710,7 @@ impl<R: CommandRunner> Remote<'_, R> {
             Ok(())
         } else {
             Err(BusyNasError::ProcessFailed {
-                program: format!("{} install", self.programs.ssh.display()),
+                program: format!("{} sh", self.programs.ssh.display()),
                 status: output.status,
                 stderr: output.stderr_text(),
             })
