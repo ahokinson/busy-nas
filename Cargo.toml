@@ -1,6 +1,6 @@
 [package]
 name = "busy-nas"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "Single-writer NAS handoff for unfinished work"
 license = "GPL-3.0-or-later"

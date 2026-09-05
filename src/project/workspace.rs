@@ -112,9 +112,10 @@ fn reject_macos_network_mount(path: &Path) -> Result<()> {
     // SAFETY: `path` is NUL terminated and `stats` points to valid writable memory.
     let result = unsafe { libc::statfs(path.as_ptr(), stats.as_mut_ptr()) };
     if result != 0 {
-        return Err(BusyNasError::UnsafeWorkspace(
-            "cannot inspect workspace filesystem".into(),
-        ));
+        let error = std::io::Error::last_os_error();
+        return Err(BusyNasError::UnsafeWorkspace(format!(
+            "cannot inspect workspace filesystem ({error})"
+        )));
     }
     // SAFETY: a successful statfs call initializes the entire struct.
     let stats = unsafe { stats.assume_init() };
@@ -140,5 +141,13 @@ mod tests {
             unescape_mount_path("/tmp/a\\040b"),
             std::path::PathBuf::from("/tmp/a b")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn plain_local_temp_directory_is_a_safe_workspace() {
+        use super::validate_local_workspace;
+        let temporary = tempfile::tempdir().unwrap();
+        validate_local_workspace(temporary.path()).unwrap();
     }
 }
