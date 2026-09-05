@@ -2,6 +2,8 @@ use std::{fmt, str::FromStr};
 
 use crate::{BusyNasError, Result};
 
+pub mod workspace;
+
 /// A path-safe project slug.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ProjectName(String);

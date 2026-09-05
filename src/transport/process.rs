@@ -12,6 +12,7 @@ pub struct CommandSpec {
     pub program: PathBuf,
     pub args: Vec<OsString>,
     pub stdin: Option<Vec<u8>>,
+    pub stream_output: bool,
 }
 
 impl CommandSpec {
@@ -23,6 +24,7 @@ impl CommandSpec {
             program: program.into(),
             args: args.into_iter().map(Into::into).collect(),
             stdin: None,
+            stream_output: false,
         }
     }
 
@@ -79,10 +81,12 @@ impl ProcessRunner {
 impl CommandRunner for ProcessRunner {
     fn run(&mut self, spec: &CommandSpec) -> Result<CommandOutput> {
         let mut command = Command::new(&spec.program);
-        command
-            .args(&spec.args)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+        command.args(&spec.args);
+        if spec.stream_output {
+            command.stdout(Stdio::inherit()).stderr(Stdio::inherit());
+        } else {
+            command.stdout(Stdio::piped()).stderr(Stdio::piped());
+        }
         if spec.stdin.is_some() {
             command.stdin(Stdio::piped());
         }
@@ -100,13 +104,23 @@ impl CommandRunner for ProcessRunner {
                 .write_all(input)
                 .map_err(BusyNasError::ConfigRead)?;
         }
-        let output = child.wait_with_output().map_err(BusyNasError::ConfigRead)?;
-        Ok(CommandOutput {
-            success: output.status.success(),
-            status: output.status.code().unwrap_or(-1),
-            stdout: output.stdout,
-            stderr: output.stderr,
-        })
+        if spec.stream_output {
+            let status = child.wait().map_err(BusyNasError::ConfigRead)?;
+            Ok(CommandOutput {
+                success: status.success(),
+                status: status.code().unwrap_or(-1),
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            })
+        } else {
+            let output = child.wait_with_output().map_err(BusyNasError::ConfigRead)?;
+            Ok(CommandOutput {
+                success: output.status.success(),
+                status: output.status.code().unwrap_or(-1),
+                stdout: output.stdout,
+                stderr: output.stderr,
+            })
+        }
     }
 }
 

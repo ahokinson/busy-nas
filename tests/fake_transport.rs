@@ -7,12 +7,12 @@ use std::{
 };
 
 use busy_nas::{
-    config::Config,
-    paths::AppPaths,
-    process::ProcessRunner,
+    config::{paths::AppPaths, Config},
+    lease,
     project::ProjectName,
     service::{ProgramPaths, Service},
-    state, BusyNasError,
+    transport::process::ProcessRunner,
+    BusyNasError,
 };
 use tempfile::TempDir;
 
@@ -125,7 +125,7 @@ dry_run=0
 filtered=0
 while [ "$#" -gt 2 ]; do
   case "$1" in
-    -a|--protect-args|--itemize-changes) shift ;;
+    -a|--protect-args|--itemize-changes|--info=progress2) shift ;;
     --delete) delete=1; shift ;;
     --dry-run) dry_run=1; shift ;;
     --exclude) filtered=1; shift 2 ;;
@@ -202,10 +202,12 @@ fn get_then_put_transfers_source_and_releases_lease() {
         fs::read_to_string(harness.local_project("demo").join("hello.txt")).unwrap(),
         "from-nas"
     );
-    assert!(harness
-        .remote_root
-        .join(".busy-nas/leases/demo/token")
-        .is_file());
+    let remote_lease = lease::Lease::from_toml(
+        &fs::read_to_string(harness.remote_root.join(".busy-nas/leases/demo/lease.toml")).unwrap(),
+        &project,
+    )
+    .unwrap();
+    assert_eq!(remote_lease.format_version, lease::FORMAT_VERSION);
 
     fs::write(
         harness.local_project("demo").join("hello.txt"),
@@ -219,7 +221,7 @@ fn get_then_put_transfers_source_and_releases_lease() {
     );
     assert!(!harness.local_project("demo").exists());
     assert!(!harness.remote_root.join(".busy-nas/leases/demo").exists());
-    assert!(state::read(&harness.paths, &project).is_err());
+    assert!(lease::read(&harness.paths, &project).is_err());
 }
 
 #[test]
@@ -234,7 +236,7 @@ fn failed_get_removes_partial_checkout_and_new_lease() {
     assert!(harness.service(&mut runner).get(&project).is_err());
     assert!(!harness.local_project("demo").exists());
     assert!(!harness.remote_root.join(".busy-nas/leases/demo").exists());
-    assert!(state::read(&harness.paths, &project).is_err());
+    assert!(lease::read(&harness.paths, &project).is_err());
 }
 
 #[test]
@@ -326,13 +328,58 @@ fn forced_reclaim_replaces_a_stale_lease_and_get_resumes_it() {
         .service(&mut runner)
         .reclaim(&project, true)
         .unwrap();
-    let lease = state::read(&harness.paths, &project).unwrap();
-    assert_ne!(lease.token, "lost-machine-token");
+    let lease_record = lease::read(&harness.paths, &project).unwrap();
+    assert_ne!(lease_record.token, "lost-machine-token");
     assert_eq!(
-        fs::read_to_string(stale.join("token")).unwrap().trim(),
-        lease.token
+        lease::Lease::from_toml(
+            &fs::read_to_string(stale.join("lease.toml")).unwrap(),
+            &project
+        )
+        .unwrap()
+        .token,
+        lease_record.token
     );
 
     harness.service(&mut runner).get(&project).unwrap();
     assert!(harness.local_project("demo").is_dir());
+}
+
+#[test]
+fn a_legacy_lease_can_still_be_put_and_released() {
+    let harness = Harness::new("legacy", None, None);
+    let project = project();
+    fs::create_dir_all(harness.remote_project("demo")).unwrap();
+    fs::write(harness.remote_project("demo").join("hello.txt"), "from-nas").unwrap();
+    fs::create_dir_all(harness.local_project("demo")).unwrap();
+    fs::write(
+        harness.local_project("demo").join("hello.txt"),
+        "from-local",
+    )
+    .unwrap();
+
+    let remote_lease = harness.remote_root.join(".busy-nas/leases/demo");
+    fs::create_dir_all(&remote_lease).unwrap();
+    fs::write(remote_lease.join("token"), "legacy-token\n").unwrap();
+    let local_lease = harness.paths.legacy_lease_state_file(&project);
+    fs::create_dir_all(local_lease.parent().unwrap()).unwrap();
+    fs::write(
+        local_lease,
+        r#"
+            project = "demo"
+            token = "legacy-token"
+            created_at = "2026-09-05T12:00:00Z"
+        "#,
+    )
+    .unwrap();
+
+    let mut runner = harness.runner();
+    harness.service(&mut runner).put(&project).unwrap();
+
+    assert_eq!(
+        fs::read_to_string(harness.remote_project("demo").join("hello.txt")).unwrap(),
+        "from-local"
+    );
+    assert!(!harness.local_project("demo").exists());
+    assert!(!remote_lease.exists());
+    assert!(lease::read(&harness.paths, &project).is_err());
 }

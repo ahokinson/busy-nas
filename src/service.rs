@@ -1,19 +1,21 @@
 use std::{
+    collections::BTreeSet,
     ffi::OsString,
     fs,
+    io::IsTerminal,
     path::{Path, PathBuf},
 };
 
 use chrono::Utc;
 
 use crate::{
-    config::Config,
-    filters::rsync_filter_args,
-    paths::AppPaths,
-    process::{CommandOutput, CommandRunner, CommandSpec, ProcessRunner},
-    project::ProjectName,
-    state::{self, LeaseState},
-    workspace::validate_local_workspace,
+    config::{paths::AppPaths, Config},
+    lease::{self, Lease},
+    project::{workspace::validate_local_workspace, ProjectName},
+    transport::{
+        filters::rsync_filter_args,
+        process::{CommandOutput, CommandRunner, CommandSpec, ProcessRunner},
+    },
     BusyNasError, Result,
 };
 
@@ -41,6 +43,9 @@ impl ProgramPaths {
 
 #[derive(Debug, Default, Eq, PartialEq)]
 pub struct Status {
+    pub remote: String,
+    pub remote_root: PathBuf,
+    pub workspace_root: PathBuf,
     pub projects: Vec<String>,
     pub nas_leases: Vec<String>,
     pub local_leases: Vec<String>,
@@ -48,25 +53,141 @@ pub struct Status {
 
 impl Status {
     pub fn render(&self) -> String {
-        fn section(name: &str, entries: &[String], output: &mut String) {
-            output.push_str(name);
-            output.push_str(":\n");
-            if entries.is_empty() {
-                output.push_str("  (none)\n");
-            } else {
-                for entry in entries {
-                    output.push_str("  ");
-                    output.push_str(entry);
-                    output.push('\n');
-                }
-            }
-        }
+        self.render_with_color(color_enabled(std::io::stdout().is_terminal()))
+    }
+
+    fn render_with_color(&self, color: bool) -> String {
+        let projects = self
+            .projects
+            .iter()
+            .chain(&self.nas_leases)
+            .chain(&self.local_leases)
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        let nas_leases = self
+            .nas_leases
+            .iter()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        let local_leases = self
+            .local_leases
+            .iter()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        let project_width = projects
+            .iter()
+            .map(|project| display_width(project))
+            .max()
+            .unwrap_or_default()
+            .max(display_width("project"));
+        let lease_width = display_width("lease").max(display_width("● held"));
+        let local_width = display_width("local").max(display_width("● here"));
 
         let mut output = String::new();
-        section("NAS projects", &self.projects, &mut output);
-        section("Active NAS leases", &self.nas_leases, &mut output);
-        section("Local active checkouts", &self.local_leases, &mut output);
+        output.push_str(&paint(color, "1;36", "busy-nas"));
+        output.push_str(&paint(color, "2", "  status"));
+        output.push_str("\n\n");
+        output.push_str(&format!(
+            "{}  {}:{}\n",
+            paint(color, "2", "nas"),
+            self.remote,
+            self.remote_root.display(),
+        ));
+        output.push_str(&format!(
+            "{}  {}\n\n",
+            paint(color, "2", "workdir"),
+            self.workspace_root.display(),
+        ));
+        output.push_str(&format!(
+            "{}  {}  {}\n",
+            paint(color, "1", &pad_cell("project", project_width)),
+            paint(color, "1", &pad_cell("lease", lease_width)),
+            paint(color, "1", &pad_cell("local", local_width)),
+        ));
+        output.push_str(&paint(
+            color,
+            "2",
+            &format!(
+                "{}  {}  {}\n",
+                "─".repeat(project_width),
+                "─".repeat(lease_width),
+                "─".repeat(local_width),
+            ),
+        ));
+        for project in projects {
+            let nas_lease = if nas_leases.contains(project) {
+                paint_cell(color, "33", "● held", lease_width)
+            } else {
+                paint_cell(color, "2", "·", lease_width)
+            };
+            let local_lease = if local_leases.contains(project) {
+                paint_cell(color, "32", "● here", local_width)
+            } else {
+                paint_cell(color, "2", "·", local_width)
+            };
+            output.push_str(&format!(
+                "{}  {nas_lease}  {local_lease}\n",
+                pad_cell(project, project_width),
+            ));
+        }
+        output.push_str(&format!(
+            "\n{}\n",
+            paint(
+                color,
+                "2",
+                &format!(
+                    "{} {} · {} active {} · {} local {}",
+                    self.projects.len(),
+                    pluralize(self.projects.len(), "project"),
+                    self.nas_leases.len(),
+                    pluralize(self.nas_leases.len(), "lease"),
+                    self.local_leases.len(),
+                    pluralize(self.local_leases.len(), "lease"),
+                ),
+            ),
+        ));
         output
+    }
+}
+
+fn paint(enabled: bool, code: &str, value: &str) -> String {
+    if enabled {
+        format!("\x1b[{code}m{value}\x1b[0m")
+    } else {
+        value.to_owned()
+    }
+}
+
+fn report_paint(code: &str, value: &str) -> String {
+    paint(color_enabled(std::io::stderr().is_terminal()), code, value)
+}
+
+fn color_enabled(is_terminal: bool) -> bool {
+    is_terminal
+        && std::env::var_os("NO_COLOR").is_none()
+        && std::env::var("TERM").map_or(true, |term| term != "dumb")
+}
+
+fn paint_cell(enabled: bool, code: &str, value: &str, width: usize) -> String {
+    paint(enabled, code, &pad_cell(value, width))
+}
+
+fn pad_cell(value: &str, width: usize) -> String {
+    format!(
+        "{value}{}",
+        " ".repeat(width.saturating_sub(display_width(value)))
+    )
+}
+
+fn display_width(value: &str) -> usize {
+    value.chars().count()
+}
+
+fn pluralize(count: usize, singular: &str) -> String {
+    if count == 1 {
+        singular.to_owned()
+    } else {
+        format!("{singular}s")
     }
 }
 
@@ -93,12 +214,14 @@ impl<'a, R: CommandRunner> Service<'a, R> {
     }
 
     pub fn get(&mut self, project: &ProjectName) -> Result<()> {
+        self.report_start("get", project);
         self.require_safe_workspace()?;
         let checkout = self.checkout_path(project);
         if checkout.exists() {
             return Err(BusyNasError::CheckoutExists(checkout));
         }
 
+        self.report("lease", "acquiring");
         let acquisition = self.acquire_or_resume_lease(project)?;
         let transfer = (|| {
             if !self.remote_project_exists(project)? {
@@ -106,28 +229,32 @@ impl<'a, R: CommandRunner> Service<'a, R> {
                     project.as_str().to_owned(),
                 ));
             }
+            self.report("transfer", "copying NAS to local checkout");
             self.rsync_from_nas(project, &checkout)
         })();
 
         if let Err(error) = transfer {
-            // `get` created this destination.
+            self.report("cleanup", "removing partial checkout");
             remove_checkout_if_present(&checkout)?;
             if acquisition.newly_acquired {
                 self.release_lease_if_matching(project, &acquisition.state.token)?;
-                state::remove(self.paths, project)?;
+                lease::remove(self.paths, project)?;
             }
             return Err(error);
         }
+        self.report_done(&format!("ready at {}", checkout.display()));
         Ok(())
     }
 
     pub fn put(&mut self, project: &ProjectName) -> Result<()> {
+        self.report_start("put", project);
         self.require_safe_workspace()?;
         let checkout = self.checkout_path(project);
         if !checkout.is_dir() {
             return Err(BusyNasError::CheckoutMissing(checkout));
         }
-        let lease = state::read(self.paths, project)?;
+        let lease = lease::read(self.paths, project)?;
+        self.report("lease", "checking");
         self.require_matching_lease(project, &lease.token)?;
         if !self.remote_project_exists(project)? {
             return Err(BusyNasError::RemoteProjectMissing(
@@ -135,51 +262,61 @@ impl<'a, R: CommandRunner> Service<'a, R> {
             ));
         }
 
+        self.report("snapshot", "saving canonical source");
         self.create_snapshot(project)?;
+        self.report("transfer", "copying local changes to NAS");
         self.rsync_to_nas(&checkout, project)?;
+        self.report("verify", "checking transfer");
         self.verify_to_nas(&checkout, project)?;
         self.prune_snapshots(project)?;
 
-        // Do not release the lease if local cleanup fails.
+        self.report("cleanup", "removing local checkout");
         fs::remove_dir_all(&checkout)?;
         self.release_lease_if_matching(project, &lease.token)?;
-        state::remove(self.paths, project)?;
+        lease::remove(self.paths, project)?;
+        self.report_done("NAS is canonical again");
         Ok(())
     }
 
     pub fn discard(&mut self, project: &ProjectName) -> Result<()> {
+        self.report_start("discard", project);
         self.require_safe_workspace()?;
         let checkout = self.checkout_path(project);
         if checkout.exists() && !checkout.is_dir() {
             return Err(BusyNasError::CheckoutMissing(checkout));
         }
-        let lease = state::read(self.paths, project)?;
+        let lease = lease::read(self.paths, project)?;
+        self.report("lease", "checking");
         self.require_matching_lease(project, &lease.token)?;
 
-        // Allow retries after local cleanup succeeded but lease release failed.
         if checkout.is_dir() {
+            self.report("cleanup", "removing local checkout");
             fs::remove_dir_all(&checkout)?;
         }
         self.release_lease_if_matching(project, &lease.token)?;
-        state::remove(self.paths, project)
+        lease::remove(self.paths, project)?;
+        self.report_done("checkout discarded");
+        Ok(())
     }
 
     pub fn reclaim(&mut self, project: &ProjectName, force: bool) -> Result<()> {
         if !force {
             return Err(BusyNasError::ForceRequired);
         }
+        self.report_start("reclaim", project);
         self.require_safe_workspace()?;
         let checkout = self.checkout_path(project);
         if checkout.exists() {
             return Err(BusyNasError::CheckoutExists(checkout));
         }
 
-        // Reclaim creates a new local token; `get` will resume it.
+        self.report("lease", "replacing");
         let lease_path = self.lease_path(project);
         self.remote().remove_dir_all(&lease_path)?;
-        state::remove(self.paths, project)?;
+        lease::remove(self.paths, project)?;
         let acquisition = self.acquire_or_resume_lease(project)?;
         debug_assert!(acquisition.newly_acquired);
+        self.report_done("new lease acquired");
         Ok(())
     }
 
@@ -193,24 +330,31 @@ impl<'a, R: CommandRunner> Service<'a, R> {
         let mut nas_leases = self.remote().list_directories(&leases_root)?;
         nas_leases.sort();
 
-        let mut local_leases = Vec::new();
-        let local_directory = self.paths.state_dir.join("checkouts");
-        if local_directory.is_dir() {
-            for entry in fs::read_dir(local_directory)? {
-                let entry = entry?;
-                if entry.file_type()?.is_file() {
-                    if let Some(name) = entry.path().file_stem().and_then(|name| name.to_str()) {
-                        local_leases.push(name.to_owned());
+        let mut local_leases = BTreeSet::new();
+        for local_directory in [
+            self.paths.lease_state_dir(),
+            self.paths.legacy_lease_state_dir(),
+        ] {
+            if local_directory.is_dir() {
+                for entry in fs::read_dir(local_directory)? {
+                    let entry = entry?;
+                    if entry.file_type()?.is_file() {
+                        if let Some(name) = entry.path().file_stem().and_then(|name| name.to_str())
+                        {
+                            local_leases.insert(name.to_owned());
+                        }
                     }
                 }
             }
-            local_leases.sort();
         }
 
         Ok(Status {
+            remote: self.config.remote_target(),
+            remote_root: self.config.nas.root.clone(),
+            workspace_root: self.config.workspace_root.clone(),
             projects,
             nas_leases,
-            local_leases,
+            local_leases: local_leases.into_iter().collect(),
         })
     }
 
@@ -238,7 +382,11 @@ impl<'a, R: CommandRunner> Service<'a, R> {
         self.leases_root().join(project.as_str())
     }
 
-    fn lease_token_path(&self, project: &ProjectName) -> PathBuf {
+    fn lease_metadata_path(&self, project: &ProjectName) -> PathBuf {
+        self.lease_path(project).join("lease.toml")
+    }
+
+    fn legacy_lease_token_path(&self, project: &ProjectName) -> PathBuf {
         self.lease_path(project).join("token")
     }
 
@@ -255,7 +403,7 @@ impl<'a, R: CommandRunner> Service<'a, R> {
     }
 
     fn acquire_or_resume_lease(&mut self, project: &ProjectName) -> Result<Acquisition> {
-        match state::read(self.paths, project) {
+        match lease::read(self.paths, project) {
             Ok(existing) => {
                 self.require_matching_lease(project, &existing.token)?;
                 Ok(Acquisition {
@@ -271,7 +419,7 @@ impl<'a, R: CommandRunner> Service<'a, R> {
     fn acquire_new_lease(&mut self, project: &ProjectName) -> Result<Acquisition> {
         let control_root = self.control_root();
         let lease_path = self.lease_path(project);
-        let token_path = self.lease_token_path(project);
+        let metadata_path = self.lease_metadata_path(project);
         {
             let mut remote = self.remote();
             remote.ensure_directory(&control_root)?;
@@ -282,15 +430,15 @@ impl<'a, R: CommandRunner> Service<'a, R> {
             }
         }
 
-        let lease = LeaseState::new(project);
+        let lease = Lease::new(project);
         let write_result = self
             .remote()
-            .install_file(&token_path, format!("{}\n", lease.token).into_bytes());
+            .install_file(&metadata_path, lease.to_toml()?.into_bytes());
         if let Err(error) = write_result {
             self.remote().remove_dir_all(&lease_path)?;
             return Err(error);
         }
-        if let Err(error) = state::write(self.paths, project, &lease) {
+        if let Err(error) = lease::write(self.paths, project, &lease) {
             self.remote().remove_dir_all(&lease_path)?;
             return Err(error);
         }
@@ -305,14 +453,31 @@ impl<'a, R: CommandRunner> Service<'a, R> {
         project: &ProjectName,
         expected_token: &str,
     ) -> Result<()> {
-        let token_path = self.lease_token_path(project);
-        let output = self.remote().run("cat", [token_path.into_os_string()])?;
-        if !output.success || output.stdout_text().trim() != expected_token {
+        if self.remote_lease_token(project)? != expected_token {
             return Err(BusyNasError::LeaseMismatch {
                 project: project.as_str().to_owned(),
             });
         }
         Ok(())
+    }
+
+    fn remote_lease_token(&mut self, project: &ProjectName) -> Result<String> {
+        let metadata_path = self.lease_metadata_path(project);
+        let output = self.remote().run("cat", [metadata_path.into_os_string()])?;
+        if output.success {
+            return Ok(Lease::from_toml(&output.stdout_text(), project)?.token);
+        }
+
+        let legacy_token_path = self.legacy_lease_token_path(project);
+        let output = self
+            .remote()
+            .run("cat", [legacy_token_path.into_os_string()])?;
+        if output.success {
+            return Ok(output.stdout_text().trim().to_owned());
+        }
+        Err(BusyNasError::LeaseMismatch {
+            project: project.as_str().to_owned(),
+        })
     }
 
     fn release_lease_if_matching(&mut self, project: &ProjectName, token: &str) -> Result<()> {
@@ -329,7 +494,7 @@ impl<'a, R: CommandRunner> Service<'a, R> {
     fn rsync_from_nas(&mut self, project: &ProjectName, checkout: &Path) -> Result<()> {
         let source = self.remote_endpoint(&self.remote_project_path(project), true);
         let destination = checkout.as_os_str().to_owned();
-        let spec = self.rsync_spec(source, destination, false, false);
+        let spec = self.rsync_spec(source, destination, false, false, self.show_progress());
         self.run_checked(&spec)?;
         Ok(())
     }
@@ -337,7 +502,7 @@ impl<'a, R: CommandRunner> Service<'a, R> {
     fn rsync_to_nas(&mut self, checkout: &Path, project: &ProjectName) -> Result<()> {
         let source = with_trailing_slash(checkout);
         let destination = self.remote_endpoint(&self.remote_project_path(project), true);
-        let spec = self.rsync_spec(source, destination, true, false);
+        let spec = self.rsync_spec(source, destination, true, false, self.show_progress());
         self.run_checked(&spec)?;
         Ok(())
     }
@@ -345,7 +510,7 @@ impl<'a, R: CommandRunner> Service<'a, R> {
     fn verify_to_nas(&mut self, checkout: &Path, project: &ProjectName) -> Result<()> {
         let source = with_trailing_slash(checkout);
         let destination = self.remote_endpoint(&self.remote_project_path(project), true);
-        let spec = self.rsync_spec(source, destination, true, true);
+        let spec = self.rsync_spec(source, destination, true, true, false);
         let output = self.run_checked(&spec)?;
         let differences = output.stdout_text();
         if differences.trim().is_empty() {
@@ -396,6 +561,7 @@ impl<'a, R: CommandRunner> Service<'a, R> {
         destination: OsString,
         delete: bool,
         dry_run: bool,
+        show_progress: bool,
     ) -> CommandSpec {
         let mut args: Vec<OsString> = vec!["-a".into(), "--protect-args".into()];
         args.extend(rsync_filter_args().into_iter().map(OsString::from));
@@ -406,6 +572,9 @@ impl<'a, R: CommandRunner> Service<'a, R> {
             args.push("--dry-run".into());
             args.push("--itemize-changes".into());
         }
+        if show_progress {
+            args.push("--info=progress2".into());
+        }
         args.push("-e".into());
         args.push(self.programs.ssh.clone().into_os_string());
         args.push(source);
@@ -414,6 +583,29 @@ impl<'a, R: CommandRunner> Service<'a, R> {
             program: self.programs.rsync.clone(),
             args,
             stdin: None,
+            stream_output: show_progress,
+        }
+    }
+
+    fn show_progress(&self) -> bool {
+        std::io::stdout().is_terminal()
+    }
+
+    fn report_start(&self, action: &str, project: &ProjectName) {
+        if std::io::stderr().is_terminal() {
+            eprintln!("{}  {action} {project}", report_paint("1;36", "busy-nas"));
+        }
+    }
+
+    fn report(&self, phase: &str, detail: &str) {
+        if std::io::stderr().is_terminal() {
+            eprintln!("  {}  {detail}", report_paint("2", &pad_cell(phase, 9)));
+        }
+    }
+
+    fn report_done(&self, detail: &str) {
+        if std::io::stderr().is_terminal() {
+            eprintln!("  {}  {detail}", report_paint("32", &pad_cell("done", 9)));
         }
     }
 
@@ -432,7 +624,7 @@ impl<'a, R: CommandRunner> Service<'a, R> {
 }
 
 struct Acquisition {
-    state: LeaseState,
+    state: Lease,
     newly_acquired: bool,
 }
 
@@ -458,6 +650,7 @@ impl<R: CommandRunner> Remote<'_, R> {
             program: self.programs.ssh.clone(),
             args,
             stdin: None,
+            stream_output: false,
         })
     }
 
@@ -510,6 +703,7 @@ impl<R: CommandRunner> Remote<'_, R> {
             program: self.programs.ssh.clone(),
             args: ssh_args,
             stdin: Some(contents),
+            stream_output: false,
         };
         let output = self.runner.run(&spec)?;
         if output.success {
@@ -543,15 +737,18 @@ impl<R: CommandRunner> Remote<'_, R> {
                 OsString::from("1"),
                 OsString::from("-type"),
                 OsString::from("d"),
-                OsString::from("-printf"),
-                OsString::from("%f\\n"),
             ],
         )?;
         let mut directories = output
             .stdout_text()
             .lines()
-            .filter(|line| !line.is_empty())
-            .map(ToOwned::to_owned)
+            .filter_map(|line| {
+                Path::new(line)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .filter(|name| !name.is_empty())
+                    .map(ToOwned::to_owned)
+            })
             .collect::<Vec<_>>();
         directories.sort();
         Ok(directories)
@@ -590,9 +787,8 @@ mod tests {
 
     use super::{ProgramPaths, Service};
     use crate::{
-        config::Config,
-        paths::AppPaths,
-        process::{CommandOutput, CommandRunner, CommandSpec},
+        config::{paths::AppPaths, Config},
+        transport::process::{CommandOutput, CommandRunner, CommandSpec},
     };
 
     struct RecordingRunner {
@@ -611,6 +807,13 @@ mod tests {
                 })
                 .take(32)
                 .collect(),
+                specs: Vec::new(),
+            }
+        }
+
+        fn with_results(results: impl IntoIterator<Item = CommandOutput>) -> Self {
+            Self {
+                results: results.into_iter().collect(),
                 specs: Vec::new(),
             }
         }
@@ -653,6 +856,7 @@ mod tests {
             OsString::from("nas.example:/srv/developer/demo/"),
             true,
             false,
+            false,
         );
         assert_eq!(spec.program, PathBuf::from("rsync"));
         assert!(spec.args.contains(&OsString::from("--delete")));
@@ -664,5 +868,54 @@ mod tests {
             spec.args.last(),
             Some(&OsString::from("nas.example:/srv/developer/demo/"))
         );
+
+        let progress_spec = service.rsync_spec(
+            OsString::from("/tmp/busy-nas-workspace/demo/"),
+            OsString::from("nas.example:/srv/developer/demo/"),
+            false,
+            false,
+            true,
+        );
+        assert!(progress_spec.stream_output);
+        assert!(progress_spec
+            .args
+            .contains(&OsString::from("--info=progress2")));
+    }
+
+    #[test]
+    fn status_parses_find_paths_and_renders_project_state() {
+        let config = config();
+        let temporary = tempfile::tempdir().unwrap();
+        let paths = AppPaths {
+            config_file: PathBuf::from("/tmp/config.toml"),
+            state_dir: temporary.path().join("state"),
+        };
+        let success = |stdout: &[u8]| CommandOutput {
+            success: true,
+            status: 0,
+            stdout: stdout.to_vec(),
+            stderr: Vec::new(),
+        };
+        let mut runner = RecordingRunner::with_results([
+            success(b""),
+            success(b"/srv/developer/bible\n/srv/developer/bloom\n"),
+            CommandOutput {
+                success: false,
+                status: 1,
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            },
+        ]);
+        let mut service = Service::new(&config, &paths, &mut runner, ProgramPaths::system());
+
+        let status = service.status().unwrap();
+        assert_eq!(status.projects, ["bible", "bloom"]);
+        let rendered = status.render_with_color(false);
+        assert!(rendered.contains("project"));
+        assert!(rendered.contains("lease"));
+        assert!(rendered.contains("local"));
+        assert!(rendered.contains("bible"));
+        assert!(rendered.contains("bloom"));
+        assert!(rendered.contains("2 projects · 0 active leases · 0 local leases"));
     }
 }

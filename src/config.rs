@@ -8,6 +8,8 @@ use serde::Deserialize;
 
 use crate::{BusyNasError, Result};
 
+pub mod paths;
+
 const DEFAULT_REMOTE_ROOT: &str = "/srv/developer";
 const DEFAULT_RETENTION: usize = 20;
 

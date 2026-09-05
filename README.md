@@ -29,9 +29,22 @@ user = "developer" # optional
 root = "/srv/developer"
 ```
 
-`workspace_root` must be an existing local directory, not a symlink or an NFS, SMB/CIFS, or SSHFS mount. Local lease tokens are kept in the platform state directory (`~/.local/state/busy-nas/` on Linux).
+`workspace_root` must be an existing local directory, not a symlink or an NFS, SMB/CIFS, or SSHFS mount. Local lease records are kept in the platform state directory (`~/.local/state/busy-nas/` on Linux).
 
 The NAS needs SSH, rsync, and write access to `nas.root`; it is never mounted locally.
+
+## Lease metadata
+
+New leases use the same versioned TOML document locally (`leases/<project>.toml`) and on the NAS (`.busy-nas/leases/<project>/lease.toml`):
+
+```toml
+format_version = 1
+project = "bible"
+token = "an-opaque-uuid"
+created_at = "2026-09-05T12:00:00Z"
+```
+
+Lease files are created with owner-only permissions. They identify the holder; they do not record checkout paths, Git state, or snapshot data. Snapshots are source trees only. The first release's token files are read for compatibility, then removed normally by `put` or `discard`.
 
 ## Commands
 
@@ -44,6 +57,8 @@ The NAS needs SSH, rsync, and write access to `nas.root`; it is never mounted lo
 | `reclaim <project> --force` | Replace a lease only when its owner machine is gone or unavailable.                             |
 
 `put` propagates source deletions. Before changing the canonical tree, it creates a timestamped snapshot under `<nas.root>/.busy-nas/snapshots/<project>/` and retains the configured number of snapshots. Leases live under `<nas.root>/.busy-nas/leases/<project>`.
+
+On a terminal, `get` and `put` show their current phase and rsync's aggregate transfer progress. Piped output stays quiet; `NO_COLOR` removes styling.
 
 ## What moves
 

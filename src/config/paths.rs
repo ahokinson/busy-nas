@@ -24,8 +24,20 @@ impl AppPaths {
     }
 
     pub fn lease_state_file(&self, project: &ProjectName) -> PathBuf {
-        self.state_dir
-            .join("checkouts")
+        self.lease_state_dir()
             .join(format!("{}.toml", project.as_str()))
+    }
+
+    pub fn lease_state_dir(&self) -> PathBuf {
+        self.state_dir.join("leases")
+    }
+
+    pub fn legacy_lease_state_file(&self, project: &ProjectName) -> PathBuf {
+        self.legacy_lease_state_dir()
+            .join(format!("{}.toml", project.as_str()))
+    }
+
+    pub fn legacy_lease_state_dir(&self) -> PathBuf {
+        self.state_dir.join("checkouts")
     }
 }

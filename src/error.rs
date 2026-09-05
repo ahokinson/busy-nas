@@ -18,8 +18,8 @@ pub enum BusyNasError {
     #[error("could not parse configuration: {0}")]
     ConfigParse(#[from] toml::de::Error),
 
-    #[error("could not serialize local state: {0}")]
-    StateSerialize(#[from] toml::ser::Error),
+    #[error("could not serialize lease metadata: {0}")]
+    LeaseSerialize(#[from] toml::ser::Error),
 
     #[error("invalid project name `{0}`; use a lowercase slug such as `my-project`")]
     InvalidProjectName(String),
@@ -35,6 +35,9 @@ pub enum BusyNasError {
 
     #[error("no local lease state exists for project `{0}`")]
     LocalLeaseMissing(String),
+
+    #[error("invalid lease metadata: {0}")]
+    InvalidLeaseMetadata(String),
 
     #[error("the NAS lease for `{0}` is held by another machine or cannot be acquired")]
     LeaseHeld(String),
